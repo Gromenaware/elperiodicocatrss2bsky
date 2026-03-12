@@ -38,7 +38,6 @@ def fetch_link_metadata(url):
 def get_last_bsky(client, handle):
     timeline = client.get_author_feed(handle)
     for titem in timeline.feed:
-        # Only care about top-level, non-reply posts
         if titem.reason is None and getattr(titem.post.record, "reply", None) is None:
             logging.info("Record created %s", str(titem.post.record.created_at))
             return arrow.get(titem.post.record.created_at)
@@ -48,7 +47,6 @@ def make_rich(content):
     text_builder = client_utils.TextBuilder()
     lines = content.split("\n")
     for line in lines:
-        # If the line is a URL, make it a clickable link
         if line.startswith("http"):
             url = line.strip()
             text_builder.link(url, url)
@@ -63,16 +61,14 @@ def make_rich(content):
                     text_builder.text(t)
     return text_builder
 
-def get_image_from_url(image_url, client, alt_text="Preview image"):
+# Nova funció: Només retorna el 'blob' necessari per a la miniatura de l'enllaç
+def get_blob_from_url(image_url, client):
     try:
-        r = httpx.get(image_url)
+        r = httpx.get(image_url, timeout=10)
         if r.status_code != 200:
             return None
         img_blob = client.upload_blob(r.content)
-        img_model = models.AppBskyEmbedImages.Image(
-            alt=alt_text, image=img_blob.blob
-        )
-        return img_model
+        return img_blob.blob
     except Exception as e:
         logging.warning(f"Could not fetch/upload image from {image_url}: {e}")
         return None
@@ -81,19 +77,18 @@ def is_html(text):
     return bool(re.search(r'<.*?>', text))
 
 def main():
-    # --- Parse command-line arguments ---
     parser = argparse.ArgumentParser(description="Post RSS to Bluesky.")
     parser.add_argument("rss_feed", help="RSS feed URL")
     parser.add_argument("bsky_handle", help="Bluesky handle")
     parser.add_argument("bsky_username", help="Bluesky username")
     parser.add_argument("bsky_app_password", help="Bluesky app password")
     args = parser.parse_args()
+    
     feed_url = args.rss_feed
     bsky_handle = args.bsky_handle
     bsky_username = args.bsky_username
     bsky_password = args.bsky_app_password
 
-    # --- Login ---
     client = Client()
     backoff = 60
     while True:
@@ -105,60 +100,42 @@ def main():
             time.sleep(backoff)
             backoff = min(backoff + 60, 600)
 
-    # --- Get last Bluesky post time ---
     last_bsky = get_last_bsky(client, bsky_handle)
-
-    # --- Parse feed ---
     feed = fastfeedparser.parse(feed_url)
 
     for item in feed.entries:
         rss_time = arrow.get(item.published)
         logging.info("RSS Time: %s", str(rss_time))
-        # Use only the plain title as content, and add the link on a new line
+        
         if is_html(item.title):
             title_text = BeautifulSoup(item.title, "html.parser").get_text().strip()
         else:
             title_text = item.title.strip()
+            
         post_text = f"{title_text}\n{item.link}"
-        logging.info("Title+link used as content: %s", post_text)
         rich_text = make_rich(post_text)
-        logging.info("Rich text length: %d" % (len(rich_text.build_text())))
-        logging.info("Filtered Content length: %d" % (len(post_text)))
-        if rss_time > last_bsky: # Only post if newer than last Bluesky post
-        #if True:  # FOR TESTING ONLY!
+        
+        # if rss_time > last_bsky: # Descomenta per a producció
+        if True:  # FOR TESTING ONLY!
             link_metadata = fetch_link_metadata(item.link)
-            images = []
-
-            # Try to fetch image from snippet (Open Graph/Twitter Card)
+            
+            # 1. Obtenim el blob de la imatge per a la miniatura
+            thumb_blob = None
             if link_metadata.get("image"):
-                # Prefer the RSS title, fall back to the link_metadata's title
-                alt_text = title_text or link_metadata.get("title") or "Preview image"
-                img = get_image_from_url(link_metadata["image"], client, alt_text=alt_text)
-                if img:
-                    images.append(img)
+                thumb_blob = get_blob_from_url(link_metadata["image"], client)
 
-            logging.info("Images length: %d" % (len(images)))
-
-            # --- Add external embed for link preview ---
-            external_embed = None
-            if link_metadata.get("title") or link_metadata.get("description"):
-                external_embed = models.AppBskyEmbedExternal.Main(
+            # 2. Creem l'embed extern (targeta d'enllaç) i hi assignem la miniatura
+            embed = None
+            if link_metadata.get("title") or link_metadata.get("description") or thumb_blob:
+                embed = models.AppBskyEmbedExternal.Main(
                     external=models.AppBskyEmbedExternal.External(
                         uri=item.link,
-                        title=link_metadata.get("title") or "Link",
+                        title=link_metadata.get("title") or title_text or "Enllaç",
                         description=link_metadata.get("description") or "",
-                        thumb=None,
+                        thumb=thumb_blob,  # Aquí carreguem la imatge a la targeta!
                     )
                 )
 
-            # Compose embed (images or link preview)
-            embed = None
-            if images:
-                embed = models.AppBskyEmbedImages.Main(images=images)
-            elif external_embed:
-                embed = external_embed
-
-            # Post
             try:
                 client.send_post(rich_text, embed=embed)
                 logging.info("Sent post %s" % (item.link))
