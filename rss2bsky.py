@@ -115,8 +115,8 @@ def main():
         post_text = f"{title_text}\n{item.link}"
         rich_text = make_rich(post_text)
         
-        # if rss_time > last_bsky: # Descomenta per a producció
-        if True:  # FOR TESTING ONLY!
+        if rss_time > last_bsky: # Descomenta per a producció
+        #if True:  # FOR TESTING ONLY!
             link_metadata = fetch_link_metadata(item.link)
             
             # 1. Obtenim el blob de la imatge per a la miniatura
